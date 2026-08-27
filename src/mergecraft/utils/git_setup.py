@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import base64
 import contextlib
 import os
 import shutil
@@ -184,7 +185,7 @@ def _git_get(repo_dir: str, key: str) -> str:
 
 
 def _auth_header_prefixes(remote_url: str) -> tuple[str, ...]:
-    """Return ``http.<url>`` prefixes that may receive bearer auth headers."""
+    """Return ``http.<url>`` prefixes that may receive Git Basic auth headers."""
     normalized = remote_url.strip()
     if normalized.startswith("git@"):
         host = normalized.split("@", 1)[1].split(":", 1)[0]
@@ -204,8 +205,9 @@ def git_env_for_token(token: str, *, remote_url: str = "") -> dict[str, str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     if not token:
         return env
+    credential = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
     pairs = [
-        (f"http.{prefix}.extraHeader", f"Authorization: Bearer {token}")
+        (f"http.{prefix}.extraHeader", f"Authorization: Basic {credential}")
         for prefix in _auth_header_prefixes(remote_url)
     ]
     env["GIT_CONFIG_COUNT"] = str(len(pairs))
