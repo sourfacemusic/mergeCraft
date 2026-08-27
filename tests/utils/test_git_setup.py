@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import stat
 import subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -486,10 +489,58 @@ def test_git_env_for_token_no_token_skips_config_pairs() -> None:
 
 
 def test_git_env_for_token_hostile_rewritten_origin_stays_on_github() -> None:
-    """Bearer must scope to github.com even when checkout rewrites github URLs."""
+    """Basic auth must scope to github.com even when checkout rewrites github URLs."""
     env = git_env_for_token(
         "ghs_secret",
         remote_url="https://github.com/acme/demo.git",
     )
     assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraHeader"
     assert "attacker.example" not in str(env.values())
+
+
+def test_git_env_for_token_authenticates_git_http_with_basic_auth() -> None:
+    """Git transport must be able to authenticate against a Basic-only server."""
+
+    token = "ghs_transport_token"
+    expected = "Basic " + base64.b64encode(f"x-access-token:{token}".encode()).decode()
+
+    class BasicOnlyHandler(BaseHTTPRequestHandler):
+        seen: list[str | None] = []
+
+        def do_GET(self) -> None:  # noqa: N802 - http.server callback name
+            self.__class__.seen.append(self.headers.get("Authorization"))
+            if self.headers.get("Authorization") != expected:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="git"')
+                self.end_headers()
+                return
+            body = b"# service=git-upload-pack\n0000"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-git-upload-pack-advertisement")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), BasicOnlyHandler)
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    remote = f"http://127.0.0.1:{httpd.server_port}/repo.git"
+    try:
+        result = subprocess.run(
+            ["git", "-c", "protocol.version=0", "ls-remote", remote],
+            env=git_env_for_token(token, remote_url=remote),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+    assert result.returncode == 0, result.stderr
+    assert BasicOnlyHandler.seen
+    assert all(value == expected for value in BasicOnlyHandler.seen)
